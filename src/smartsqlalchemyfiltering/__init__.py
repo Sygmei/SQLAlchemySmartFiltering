@@ -19,11 +19,15 @@ from sqlalchemy import (
     or_,
 )
 from sqlalchemy import cast as sqlcast
+from sqlalchemy import inspect as sqlinspect
+from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.sql.selectable import Join
 from sqlalchemy.sql.type_api import TypeEngine
 
 
 FieldModifier = Callable[[ColumnElement[Any]], ColumnElement[Any]]
+OrmFilterTarget = type[DeclarativeBase]
+FilterTarget = FromClause | OrmFilterTarget
 
 
 class ParsedFilter(TypedDict, total=False):
@@ -207,7 +211,7 @@ def coerce_filter_value(
 
 def coerce_filter_value_for_column(
     value: str | list[str],
-    column: ColumnElement[Any],
+    column: Any,
     parsed_single_filter: ParsedFilter,
 ) -> Any:
     column_type = column.type
@@ -227,21 +231,66 @@ def coerce_filter_value_for_column(
         ) from error
 
 
+def get_orm_mapper(target: Any) -> Any | None:
+    inspected = sqlinspect(target, raiseerr=False)
+    if inspected is None or not hasattr(inspected, "relationships"):
+        return None
+    return inspected
+
+
+def is_orm_target(target: Any) -> bool:
+    return get_orm_mapper(target) is not None
+
+
+def describe_filter_target(target: FilterTarget) -> str:
+    mapper = get_orm_mapper(target)
+    if mapper is not None:
+        return mapper.class_.__name__
+    return str(getattr(infer_table(target), "description", target))
+
+
+def list_filter_target_fields(target: FilterTarget) -> list[str]:
+    mapper = get_orm_mapper(target)
+    if mapper is not None:
+        return list(mapper.column_attrs.keys()) + list(mapper.relationships.keys())
+    return [column.key for column in reversed(list(target.columns))]
+
+
 def infer_table(table_or_join: FromClause) -> FromClause:
     if isinstance(table_or_join, Join):
         return table_or_join.left
     return table_or_join
 
 
-def infer_filter_target(query: Select) -> FromClause:
+def infer_orm_filter_target(query: Select) -> OrmFilterTarget | None:
+    entities: list[OrmFilterTarget] = []
+    for description in query.column_descriptions:
+        entity = description.get("entity")
+        if entity is not None and is_orm_target(entity) and entity not in entities:
+            entities.append(entity)
+    if len(entities) == 1:
+        return entities[0]
+    return None
+
+
+def infer_filter_target(query: Select) -> FilterTarget:
+    orm_target = infer_orm_filter_target(query)
+    if orm_target is not None:
+        return orm_target
+
     final_froms = query.get_final_froms()
     if len(final_froms) != 1 or isinstance(final_froms[0], Join):
         raise AmbiguousFilterTarget()
     return final_froms[0]
 
 
-def rebuild_incomplete_filter(table: FromClause, single_filter: str) -> list[ParsedFilter]:
-    autosearch_fields = dict(getattr(infer_table(table), "kwargs", {})).get(
+def rebuild_incomplete_filter(
+    target: FilterTarget,
+    single_filter: str,
+) -> list[ParsedFilter]:
+    mapper = get_orm_mapper(target)
+    autosearch_source = mapper.local_table if mapper is not None else infer_table(target)
+    autosearch_fields = dict(getattr(autosearch_source, "kwargs", {})).get(
         "autosearch_fields",
         {},
     )
@@ -274,7 +323,10 @@ def parse_single_filter(single_filter: str) -> list[ParsedFilter] | None:
     return None
 
 
-def parse_filter_spec(table: FromClause, filter_spec: str) -> list[list[ParsedFilter]]:
+def parse_filter_spec(
+    target: FilterTarget,
+    filter_spec: str,
+) -> list[list[ParsedFilter]]:
     filter_parts = split_filter_spec(filter_spec)
     parsed_filter_parts = []
     for filter_part in filter_parts:
@@ -283,26 +335,15 @@ def parse_filter_spec(table: FromClause, filter_spec: str) -> list[list[ParsedFi
             parsed_filter_parts.append(parsed_filter_part)
         else:
             parsed_filter_parts.append(
-                rebuild_incomplete_filter(table=table, single_filter=filter_part)
+                rebuild_incomplete_filter(target=target, single_filter=filter_part)
             )
     return parsed_filter_parts
 
 
-def build_orm_filter(
-    table: FromClause,
+def build_column_filter(
+    column: Any,
     parsed_single_filter: ParsedFilter,
 ) -> ColumnExpressionArgument[bool]:
-    columns_map = {column.key: column for column in reversed(list(table.columns))}
-    single_filter_column = parsed_single_filter["field"]
-    if single_filter_column not in columns_map:
-        target_type = str(getattr(infer_table(table), "description", table))
-        raise InvalidFilteringColumn(
-            filter_query=parsed_single_filter["original_filter"],
-            target_type=target_type,
-            column=single_filter_column,
-            available_columns=list(columns_map.keys()),
-        )
-    column = columns_map[single_filter_column]
     if "field_modifier" in parsed_single_filter:
         column = parsed_single_filter["field_modifier"](column)
     operator = parsed_single_filter["op"].strip()
@@ -339,20 +380,108 @@ def build_orm_filter(
     return column_operator(column_value)
 
 
-def apply_filters_from_filter_spec(
-    query: Select, filter_spec: str, table_hint: FromClause | None = None
-) -> Select:
-    final_query: Select = query
-    target_table: FromClause = (
-        infer_table(table_hint) if table_hint is not None else infer_filter_target(query)
+def build_table_filter(
+    table: FromClause,
+    parsed_single_filter: ParsedFilter,
+) -> ColumnExpressionArgument[bool]:
+    columns_map = {column.key: column for column in reversed(list(table.columns))}
+    single_filter_column = parsed_single_filter["field"]
+    if single_filter_column not in columns_map:
+        raise InvalidFilteringColumn(
+            filter_query=parsed_single_filter["original_filter"],
+            target_type=describe_filter_target(table),
+            column=single_filter_column,
+            available_columns=list(columns_map.keys()),
+        )
+    return build_column_filter(
+        column=columns_map[single_filter_column],
+        parsed_single_filter=parsed_single_filter,
     )
 
-    parsed_filter_spec = parse_filter_spec(table=target_table, filter_spec=filter_spec)
+
+def build_orm_path_filter(
+    target: OrmFilterTarget,
+    field_path: list[str],
+    parsed_single_filter: ParsedFilter,
+) -> ColumnExpressionArgument[bool]:
+    mapper = get_orm_mapper(target)
+    if mapper is None:
+        raise InvalidFilteringColumn(
+            filter_query=parsed_single_filter["original_filter"],
+            target_type=str(target),
+            column=parsed_single_filter["field"],
+            available_columns=[],
+        )
+
+    field_name = field_path[0]
+    if len(field_path) == 1:
+        if field_name not in mapper.column_attrs:
+            raise InvalidFilteringColumn(
+                filter_query=parsed_single_filter["original_filter"],
+                target_type=describe_filter_target(target),
+                column=parsed_single_filter["field"],
+                available_columns=list_filter_target_fields(target),
+            )
+        return build_column_filter(
+            column=getattr(target, field_name),
+            parsed_single_filter=parsed_single_filter,
+        )
+
+    if field_name not in mapper.relationships:
+        raise InvalidFilteringColumn(
+            filter_query=parsed_single_filter["original_filter"],
+            target_type=describe_filter_target(target),
+            column=parsed_single_filter["field"],
+            available_columns=list_filter_target_fields(target),
+        )
+
+    relationship = mapper.relationships[field_name]
+    relationship_filter = build_orm_path_filter(
+        target=relationship.mapper.class_,
+        field_path=field_path[1:],
+        parsed_single_filter=parsed_single_filter,
+    )
+    relationship_attribute = getattr(target, field_name)
+    if relationship.uselist:
+        return relationship_attribute.any(relationship_filter)
+    return relationship_attribute.has(relationship_filter)
+
+
+def build_orm_filter(
+    target: FilterTarget,
+    parsed_single_filter: ParsedFilter,
+) -> ColumnExpressionArgument[bool]:
+    mapper = get_orm_mapper(target)
+    if mapper is not None:
+        return build_orm_path_filter(
+            target=mapper.class_,
+            field_path=parsed_single_filter["field"].split("."),
+            parsed_single_filter=parsed_single_filter,
+        )
+    return build_table_filter(
+        table=infer_table(target),
+        parsed_single_filter=parsed_single_filter,
+    )
+
+
+def apply_filters_from_filter_spec(
+    query: Select, filter_spec: str, table_hint: FilterTarget | None = None
+) -> Select:
+    final_query: Select = query
+    target: FilterTarget = (
+        infer_table(table_hint)
+        if isinstance(table_hint, FromClause)
+        else table_hint
+        if table_hint is not None
+        else infer_filter_target(query)
+    )
+
+    parsed_filter_spec = parse_filter_spec(target=target, filter_spec=filter_spec)
 
     for single_filter in parsed_filter_spec:
         orm_filters = [
             build_orm_filter(
-                table=target_table,
+                target=target,
                 parsed_single_filter=single_filter_part,
             )
             for single_filter_part in single_filter
