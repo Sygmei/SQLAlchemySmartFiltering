@@ -12,6 +12,7 @@ from sqlalchemy import (
     Float,
     FromClause,
     Integer,
+    JSON,
     Numeric,
     Select,
     String,
@@ -119,7 +120,7 @@ VERB_OPERATOR_PATTERN = "|".join(
     re.escape(operator) for operator in sorted(VERB_OPERATORS, key=len, reverse=True)
 )
 GENERAL_FILTER_SHAPE = re.compile(
-    r"^(?P<field>[a-zA-Z._]+)"
+    r"^(?P<field>[a-zA-Z_][a-zA-Z0-9_.]*)"
     rf"(?P<op>\s+(?:{VERB_OPERATOR_PATTERN})\s+|\s*(?:{SYMBOL_OPERATOR_PATTERN})\s*)"
     r"(?P<value>.*)?$"
 )
@@ -229,6 +230,17 @@ def coerce_filter_value_for_column(
             value=str(value),
             target_type=str(column_type),
         ) from error
+
+
+def is_json_column(column: Any) -> bool:
+    return isinstance(column.type, JSON)
+
+
+def build_json_path_column(column: Any, path: list[str]) -> Any:
+    json_column = column
+    for path_part in path:
+        json_column = json_column[path_part]
+    return json_column.as_string()
 
 
 def get_orm_mapper(target: Any) -> Any | None:
@@ -387,6 +399,15 @@ def build_table_filter(
     columns_map = {column.key: column for column in reversed(list(table.columns))}
     single_filter_column = parsed_single_filter["field"]
     if single_filter_column not in columns_map:
+        field_path = single_filter_column.split(".")
+        if field_path[0] in columns_map and is_json_column(columns_map[field_path[0]]):
+            return build_column_filter(
+                column=build_json_path_column(
+                    column=columns_map[field_path[0]],
+                    path=field_path[1:],
+                ),
+                parsed_single_filter=parsed_single_filter,
+            )
         raise InvalidFilteringColumn(
             filter_query=parsed_single_filter["original_filter"],
             target_type=describe_filter_target(table),
@@ -426,6 +447,17 @@ def build_orm_path_filter(
             column=getattr(target, field_name),
             parsed_single_filter=parsed_single_filter,
         )
+
+    if field_name in mapper.column_attrs:
+        column = getattr(target, field_name)
+        if is_json_column(column):
+            return build_column_filter(
+                column=build_json_path_column(
+                    column=column,
+                    path=field_path[1:],
+                ),
+                parsed_single_filter=parsed_single_filter,
+            )
 
     if field_name not in mapper.relationships:
         raise InvalidFilteringColumn(
