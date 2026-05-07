@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 from datetime import date, datetime, time
 from decimal import Decimal
 import re
-from typing import Any, Callable, TypedDict
+from typing import Callable, TypeAlias, TypeGuard, TypedDict, cast
 
 from sqlalchemy import (
     Boolean,
@@ -21,14 +23,18 @@ from sqlalchemy import (
 )
 from sqlalchemy import cast as sqlcast
 from sqlalchemy import inspect as sqlinspect
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import DeclarativeBase, Mapper
+from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.sql.selectable import Join
 from sqlalchemy.sql.type_api import TypeEngine
 
 
-FieldModifier = Callable[[ColumnElement[Any]], ColumnElement[Any]]
-OrmFilterTarget = type[DeclarativeBase]
-FilterTarget = FromClause | OrmFilterTarget
+FilterColumn: TypeAlias = ColumnElement[object] | InstrumentedAttribute[object]
+FieldModifier: TypeAlias = Callable[[FilterColumn], FilterColumn]
+OrmFilterTarget: TypeAlias = type[DeclarativeBase]
+FilterTarget: TypeAlias = FromClause | OrmFilterTarget
+FilterValue: TypeAlias = str | int | float | Decimal | bool | date | datetime | time
+CoercedFilterValue: TypeAlias = FilterValue | list[FilterValue]
 
 
 class ParsedFilter(TypedDict, total=False):
@@ -188,8 +194,8 @@ def parse_bool_value(value: str) -> bool:
 
 def coerce_filter_value(
     value: str,
-    column_type: TypeEngine[Any],
-) -> Any:
+    column_type: TypeEngine[object],
+) -> FilterValue:
     if isinstance(column_type, DateTime):
         return datetime.fromisoformat(normalize_datetime_value(value))
     if isinstance(column_type, Date):
@@ -212,9 +218,9 @@ def coerce_filter_value(
 
 def coerce_filter_value_for_column(
     value: str | list[str],
-    column: Any,
+    column: FilterColumn,
     parsed_single_filter: ParsedFilter,
-) -> Any:
+) -> CoercedFilterValue:
     column_type = column.type
     try:
         if isinstance(value, list):
@@ -232,38 +238,38 @@ def coerce_filter_value_for_column(
         ) from error
 
 
-def is_json_column(column: Any) -> bool:
+def is_json_column(column: FilterColumn) -> bool:
     return isinstance(column.type, JSON)
 
 
-def build_json_path_column(column: Any, path: list[str]) -> Any:
+def build_json_path_column(column: FilterColumn, path: list[str]) -> FilterColumn:
     json_column = column
     for path_part in path:
         json_column = json_column[path_part]
-    return json_column.as_string()
+    return cast(FilterColumn, json_column.as_string())
 
 
-def get_orm_mapper(target: Any) -> Any | None:
+def is_orm_target(target: object) -> TypeGuard[OrmFilterTarget]:
+    if not isinstance(target, type):
+        return False
     inspected = sqlinspect(target, raiseerr=False)
-    if inspected is None or not hasattr(inspected, "relationships"):
-        return None
-    return inspected
+    return isinstance(inspected, Mapper)
 
 
-def is_orm_target(target: Any) -> bool:
-    return get_orm_mapper(target) is not None
+def get_orm_mapper(target: OrmFilterTarget) -> Mapper[DeclarativeBase]:
+    return cast(Mapper[DeclarativeBase], sqlinspect(target))
 
 
 def describe_filter_target(target: FilterTarget) -> str:
-    mapper = get_orm_mapper(target)
-    if mapper is not None:
+    if is_orm_target(target):
+        mapper = get_orm_mapper(target)
         return mapper.class_.__name__
     return str(getattr(infer_table(target), "description", target))
 
 
 def list_filter_target_fields(target: FilterTarget) -> list[str]:
-    mapper = get_orm_mapper(target)
-    if mapper is not None:
+    if is_orm_target(target):
+        mapper = get_orm_mapper(target)
         return list(mapper.column_attrs.keys()) + list(mapper.relationships.keys())
     return [column.key for column in reversed(list(target.columns))]
 
@@ -300,8 +306,10 @@ def rebuild_incomplete_filter(
     target: FilterTarget,
     single_filter: str,
 ) -> list[ParsedFilter]:
-    mapper = get_orm_mapper(target)
-    autosearch_source = mapper.local_table if mapper is not None else infer_table(target)
+    if is_orm_target(target):
+        autosearch_source = get_orm_mapper(target).local_table
+    else:
+        autosearch_source = infer_table(target)
     autosearch_fields = dict(getattr(autosearch_source, "kwargs", {})).get(
         "autosearch_fields",
         {},
@@ -353,7 +361,7 @@ def parse_filter_spec(
 
 
 def build_column_filter(
-    column: Any,
+    column: FilterColumn,
     parsed_single_filter: ParsedFilter,
 ) -> ColumnExpressionArgument[bool]:
     if "field_modifier" in parsed_single_filter:
@@ -384,11 +392,12 @@ def build_column_filter(
             column_value[0] = column_value[0].removeprefix("[")
             column_value[-1] = column_value[-1].removesuffix("]")
     if operator != "like":
-        column_value = coerce_filter_value_for_column(
+        coerced_column_value = coerce_filter_value_for_column(
             value=column_value,
             column=column,
             parsed_single_filter=parsed_single_filter,
         )
+        return column_operator(coerced_column_value)
     return column_operator(column_value)
 
 
@@ -426,13 +435,6 @@ def build_orm_path_filter(
     parsed_single_filter: ParsedFilter,
 ) -> ColumnExpressionArgument[bool]:
     mapper = get_orm_mapper(target)
-    if mapper is None:
-        raise InvalidFilteringColumn(
-            filter_query=parsed_single_filter["original_filter"],
-            target_type=str(target),
-            column=parsed_single_filter["field"],
-            available_columns=[],
-        )
 
     field_name = field_path[0]
     if len(field_path) == 1:
@@ -469,7 +471,7 @@ def build_orm_path_filter(
 
     relationship = mapper.relationships[field_name]
     relationship_filter = build_orm_path_filter(
-        target=relationship.mapper.class_,
+        target=cast(OrmFilterTarget, relationship.mapper.class_),
         field_path=field_path[1:],
         parsed_single_filter=parsed_single_filter,
     )
@@ -483,10 +485,10 @@ def build_orm_filter(
     target: FilterTarget,
     parsed_single_filter: ParsedFilter,
 ) -> ColumnExpressionArgument[bool]:
-    mapper = get_orm_mapper(target)
-    if mapper is not None:
+    if is_orm_target(target):
+        mapper = get_orm_mapper(target)
         return build_orm_path_filter(
-            target=mapper.class_,
+            target=cast(OrmFilterTarget, mapper.class_),
             field_path=parsed_single_filter["field"].split("."),
             parsed_single_filter=parsed_single_filter,
         )
