@@ -1,9 +1,21 @@
 import re
-from typing import cast
+from typing import Any, Callable, TypedDict
 
-from sqlalchemy import ColumnExpressionArgument, FromClause, Select, String, Table, or_
+from sqlalchemy import ColumnElement, ColumnExpressionArgument, FromClause, Select, String, or_
 from sqlalchemy import cast as sqlcast
-from sqlalchemy.orm.util import _ORMJoin
+from sqlalchemy.sql.selectable import Join
+
+
+FieldModifier = Callable[[ColumnElement[Any]], ColumnElement[Any]]
+
+
+class ParsedFilter(TypedDict, total=False):
+    original_filter: str
+    field: str
+    op: str
+    value: str | None
+    field_modifier: FieldModifier
+
 
 class InvalidFilteringColumn(Exception):
     def __init__(
@@ -33,6 +45,14 @@ class InvalidFilterOperator(Exception):
     def __str__(self):
         return f"Invalid filter operator '{self.operator}' in filter query '{self.filter_query}'."
 
+
+class AmbiguousFilterTarget(Exception):
+    def __str__(self):
+        return (
+            "Cannot infer a primary filtering target from this query. "
+            "Pass table_hint to indicate which table should receive unqualified filters."
+        )
+
 SYMBOL_OPERATORS = {
     "=": "eq",
     "==": "eq",
@@ -44,8 +64,6 @@ SYMBOL_OPERATORS = {
     "~=": "like",
 }
 OPERATORS_ACCESSORS = {
-    "is_null": lambda c: lambda *_: c.is_(None),
-    "is_not_null": lambda c: lambda *_: c.is_not(None),
     "eq": lambda c: c.__eq__,
     "ne": lambda c: c.__ne__,
     "gt": lambda c: c.__gt__,
@@ -57,27 +75,84 @@ OPERATORS_ACCESSORS = {
     "like": lambda c: c.like,
 }
 VERB_OPERATORS = set(OPERATORS_ACCESSORS.keys())
+NULL_SYMBOL = "<null>"
 
-GENERAL_FILTER_SHAPE = (
+SYMBOL_OPERATOR_PATTERN = "|".join(
+    re.escape(operator) for operator in sorted(SYMBOL_OPERATORS, key=len, reverse=True)
+)
+VERB_OPERATOR_PATTERN = "|".join(
+    re.escape(operator) for operator in sorted(VERB_OPERATORS, key=len, reverse=True)
+)
+GENERAL_FILTER_SHAPE = re.compile(
     r"^(?P<field>[a-zA-Z._]+)"
-    r"(?P<op>(\s+([a-zA-Z_]+)\s+)|(\s*([^a-zA-Z_0-9]+)\s*))"
-    r"(?P<value>.+)?"
+    rf"(?P<op>\s+(?:{VERB_OPERATOR_PATTERN})\s+|\s*(?:{SYMBOL_OPERATOR_PATTERN})\s*)"
+    r"(?P<value>.*)?$"
 )
 
 
-def infer_table(table_or_join: Table | _ORMJoin):
-    if table_or_join._is_table:
-        return table_or_join
-    if table_or_join._is_join:
+def split_filter_spec(filter_spec: str) -> list[str]:
+    filter_parts: list[str] = []
+    current_filter_part: list[str] = []
+    active_quote: str | None = None
+    escaped = False
+
+    for char in filter_spec:
+        if escaped:
+            if char in {active_quote, "\\"}:
+                current_filter_part.append(char)
+            else:
+                current_filter_part.extend(["\\", char])
+            escaped = False
+            continue
+        if char == "\\" and active_quote is not None:
+            escaped = True
+            continue
+        if char in {'"', "'"}:
+            if active_quote is None:
+                active_quote = char
+            elif active_quote == char:
+                active_quote = None
+        if char == "," and active_quote is None:
+            filter_parts.append("".join(current_filter_part))
+            current_filter_part = []
+            continue
+        current_filter_part.append(char)
+
+    if escaped:
+        current_filter_part.append("\\")
+    filter_parts.append("".join(current_filter_part))
+    return filter_parts
+
+
+def is_quoted_filter_value(value: str) -> bool:
+    return len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}
+
+
+def unquote_filter_value(value: str) -> str:
+    if not is_quoted_filter_value(value):
+        return value
+    quote = value[0]
+    return value[1:-1].replace(f"\\{quote}", quote).replace("\\\\", "\\")
+
+
+def infer_table(table_or_join: FromClause) -> FromClause:
+    if isinstance(table_or_join, Join):
         return table_or_join.left
-    raise RuntimeError("invalid object", table_or_join, "expected table or join")
+    return table_or_join
 
 
-def rebuild_incomplete_filter(table: Table, single_filter: str) -> list[dict]:
-    if table._is_table:
-        autosearch_fields = dict(table.kwargs).get("autosearch_fields", {})
-    elif table._is_join:
-        autosearch_fields = dict(table.left.kwargs).get("autosearch_fields", {})
+def infer_filter_target(query: Select) -> FromClause:
+    final_froms = query.get_final_froms()
+    if len(final_froms) != 1 or isinstance(final_froms[0], Join):
+        raise AmbiguousFilterTarget()
+    return final_froms[0]
+
+
+def rebuild_incomplete_filter(table: FromClause, single_filter: str) -> list[ParsedFilter]:
+    autosearch_fields = dict(getattr(infer_table(table), "kwargs", {})).get(
+        "autosearch_fields",
+        {},
+    )
     return [
         {
             "field": field,
@@ -90,21 +165,25 @@ def rebuild_incomplete_filter(table: Table, single_filter: str) -> list[dict]:
     ]
 
 
-def parse_single_filter(single_filter: str) -> list[dict] | None:
-    res = re.match(
-        GENERAL_FILTER_SHAPE,
-        single_filter,
-    )
+def parse_single_filter(single_filter: str) -> list[ParsedFilter] | None:
+    res = GENERAL_FILTER_SHAPE.match(single_filter)
     if res:
         operator = res.group("op")
         if operator.strip() not in VERB_OPERATORS | SYMBOL_OPERATORS.keys():
             raise InvalidFilterOperator(single_filter, operator)
-        return [{"original_filter": single_filter, **res.groupdict()}]
+        return [
+            {
+                "original_filter": single_filter,
+                "field": res.group("field"),
+                "op": operator,
+                "value": res.group("value"),
+            }
+        ]
     return None
 
 
-def parse_filter_spec(table: Table, filter_spec: str) -> list[list[dict]]:
-    filter_parts = filter_spec.split(",")
+def parse_filter_spec(table: FromClause, filter_spec: str) -> list[list[ParsedFilter]]:
+    filter_parts = split_filter_spec(filter_spec)
     parsed_filter_parts = []
     for filter_part in filter_parts:
         parsed_filter_part = parse_single_filter(single_filter=filter_part)
@@ -118,15 +197,16 @@ def parse_filter_spec(table: Table, filter_spec: str) -> list[list[dict]]:
 
 
 def build_orm_filter(
-    table: FromClause | Table,
-    parsed_single_filter: dict,
+    table: FromClause,
+    parsed_single_filter: ParsedFilter,
 ) -> ColumnExpressionArgument[bool]:
-    columns_map = {column.key: column for column in reversed(table.columns._all_columns)}
+    columns_map = {column.key: column for column in reversed(list(table.columns))}
     single_filter_column = parsed_single_filter["field"]
     if single_filter_column not in columns_map:
+        target_type = str(getattr(infer_table(table), "description", table))
         raise InvalidFilteringColumn(
             filter_query=parsed_single_filter["original_filter"],
-            target_type=infer_table(table).name,
+            target_type=target_type,
             column=single_filter_column,
             available_columns=list(columns_map.keys()),
         )
@@ -136,10 +216,25 @@ def build_orm_filter(
     operator = parsed_single_filter["op"].strip()
     if operator in SYMBOL_OPERATORS:
         operator = SYMBOL_OPERATORS[operator]
+    raw_column_value = (parsed_single_filter.get("value") or "").strip()
+    is_quoted_value = is_quoted_filter_value(raw_column_value)
+    raw_column_value = unquote_filter_value(raw_column_value)
+    if (
+        not is_quoted_value
+        and raw_column_value == NULL_SYMBOL
+        and operator in {"eq", "ne"}
+    ):
+        return column.is_(None) if operator == "eq" else column.is_not(None)
     column_operator = OPERATORS_ACCESSORS[operator](column)
-    column_value: str = parsed_single_filter.get("value", "").strip()
-    if column_value.startswith("[") and column_value.endswith("]"):
-        column_value = [column_value_item.strip() for column_value_item in column_value.split("|")]
+    column_value: str | list[str] = raw_column_value
+    if (
+        not is_quoted_value
+        and raw_column_value.startswith("[")
+        and raw_column_value.endswith("]")
+    ):
+        column_value = [
+            column_value_item.strip() for column_value_item in raw_column_value.split("|")
+        ]
         if column_value:
             column_value[0] = column_value[0].removeprefix("[")
             column_value[-1] = column_value[-1].removesuffix("]")
@@ -147,11 +242,11 @@ def build_orm_filter(
 
 
 def apply_filters_from_filter_spec(
-    query: Select, filter_spec: str, table_hint: FromClause | Table | None = None
+    query: Select, filter_spec: str, table_hint: FromClause | None = None
 ) -> Select:
     final_query: Select = query
-    target_table: FromClause | Table = (
-        table_hint if table_hint is not None else cast(Table, query.froms[0])
+    target_table: FromClause = (
+        infer_table(table_hint) if table_hint is not None else infer_filter_target(query)
     )
 
     parsed_filter_spec = parse_filter_spec(table=target_table, filter_spec=filter_spec)
