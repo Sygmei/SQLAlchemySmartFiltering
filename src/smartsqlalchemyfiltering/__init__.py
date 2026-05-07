@@ -1,9 +1,26 @@
+from datetime import date, datetime, time
+from decimal import Decimal
 import re
 from typing import Any, Callable, TypedDict
 
-from sqlalchemy import ColumnElement, ColumnExpressionArgument, FromClause, Select, String, or_
+from sqlalchemy import (
+    Boolean,
+    ColumnElement,
+    ColumnExpressionArgument,
+    Date,
+    DateTime,
+    Float,
+    FromClause,
+    Integer,
+    Numeric,
+    Select,
+    String,
+    Time,
+    or_,
+)
 from sqlalchemy import cast as sqlcast
 from sqlalchemy.sql.selectable import Join
+from sqlalchemy.sql.type_api import TypeEngine
 
 
 FieldModifier = Callable[[ColumnElement[Any]], ColumnElement[Any]]
@@ -51,6 +68,20 @@ class AmbiguousFilterTarget(Exception):
         return (
             "Cannot infer a primary filtering target from this query. "
             "Pass table_hint to indicate which table should receive unqualified filters."
+        )
+
+
+class InvalidFilterValue(Exception):
+    def __init__(self, filter_query: str, column: str, value: str, target_type: str):
+        self.filter_query = filter_query
+        self.column = column
+        self.value = value
+        self.target_type = target_type
+
+    def __str__(self):
+        return (
+            f"Invalid filter value '{self.value}' for column '{self.column}' "
+            f"of type '{self.target_type}' in filter query '{self.filter_query}'."
         )
 
 SYMBOL_OPERATORS = {
@@ -133,6 +164,67 @@ def unquote_filter_value(value: str) -> str:
         return value
     quote = value[0]
     return value[1:-1].replace(f"\\{quote}", quote).replace("\\\\", "\\")
+
+
+def normalize_datetime_value(value: str) -> str:
+    if value.endswith("Z"):
+        return value[:-1] + "+00:00"
+    return value
+
+
+def parse_bool_value(value: str) -> bool:
+    normalized_value = value.lower()
+    if normalized_value in {"true", "1", "yes"}:
+        return True
+    if normalized_value in {"false", "0", "no"}:
+        return False
+    raise ValueError
+
+
+def coerce_filter_value(
+    value: str,
+    column_type: TypeEngine[Any],
+) -> Any:
+    if isinstance(column_type, DateTime):
+        return datetime.fromisoformat(normalize_datetime_value(value))
+    if isinstance(column_type, Date):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return datetime.fromisoformat(normalize_datetime_value(value)).date()
+    if isinstance(column_type, Time):
+        return time.fromisoformat(normalize_datetime_value(value))
+    if isinstance(column_type, Integer):
+        return int(value)
+    if isinstance(column_type, Float):
+        return float(value)
+    if isinstance(column_type, Numeric):
+        return Decimal(value)
+    if isinstance(column_type, Boolean):
+        return parse_bool_value(value)
+    return value
+
+
+def coerce_filter_value_for_column(
+    value: str | list[str],
+    column: ColumnElement[Any],
+    parsed_single_filter: ParsedFilter,
+) -> Any:
+    column_type = column.type
+    try:
+        if isinstance(value, list):
+            return [
+                coerce_filter_value(unquote_filter_value(item.strip()), column_type)
+                for item in value
+            ]
+        return coerce_filter_value(value, column_type)
+    except ValueError as error:
+        raise InvalidFilterValue(
+            filter_query=parsed_single_filter["original_filter"],
+            column=parsed_single_filter["field"],
+            value=str(value),
+            target_type=str(column_type),
+        ) from error
 
 
 def infer_table(table_or_join: FromClause) -> FromClause:
@@ -238,6 +330,12 @@ def build_orm_filter(
         if column_value:
             column_value[0] = column_value[0].removeprefix("[")
             column_value[-1] = column_value[-1].removesuffix("]")
+    if operator != "like":
+        column_value = coerce_filter_value_for_column(
+            value=column_value,
+            column=column,
+            parsed_single_filter=parsed_single_filter,
+        )
     return column_operator(column_value)
 
 
