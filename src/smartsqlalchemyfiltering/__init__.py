@@ -22,14 +22,19 @@ from sqlalchemy import (
     or_,
 )
 from sqlalchemy import cast as sqlcast
+from sqlalchemy.ext.associationproxy import AssociationProxy, AssociationProxyInstance
 from sqlalchemy import inspect as sqlinspect
-from sqlalchemy.orm import DeclarativeBase, Mapper
+from sqlalchemy.orm import DeclarativeBase, Mapper, RelationshipProperty
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.sql.selectable import Join
 from sqlalchemy.sql.type_api import TypeEngine
 
 
-FilterColumn: TypeAlias = ColumnElement[object] | InstrumentedAttribute[object]
+FilterColumn: TypeAlias = (
+    ColumnElement[object]
+    | InstrumentedAttribute[object]
+    | AssociationProxyInstance[object]
+)
 FieldModifier: TypeAlias = Callable[[FilterColumn], FilterColumn]
 OrmFilterTarget: TypeAlias = type[DeclarativeBase]
 FilterTarget: TypeAlias = FromClause | OrmFilterTarget
@@ -216,12 +221,23 @@ def coerce_filter_value(
     return value
 
 
+def get_filter_column_type(column: FilterColumn) -> TypeEngine[object] | None:
+    if isinstance(column, AssociationProxyInstance):
+        return cast(
+            TypeEngine[object] | None,
+            getattr(column.remote_attr, "type", None),
+        )
+    return column.type
+
+
 def coerce_filter_value_for_column(
     value: str | list[str],
     column: FilterColumn,
     parsed_single_filter: ParsedFilter,
 ) -> CoercedFilterValue:
-    column_type = column.type
+    column_type = get_filter_column_type(column)
+    if column_type is None:
+        return value
     try:
         if isinstance(value, list):
             return [
@@ -239,7 +255,7 @@ def coerce_filter_value_for_column(
 
 
 def is_json_column(column: FilterColumn) -> bool:
-    return isinstance(column.type, JSON)
+    return isinstance(get_filter_column_type(column), JSON)
 
 
 def build_json_path_column(column: FilterColumn, path: list[str]) -> FilterColumn:
@@ -260,6 +276,17 @@ def get_orm_mapper(target: OrmFilterTarget) -> Mapper[DeclarativeBase]:
     return cast(Mapper[DeclarativeBase], sqlinspect(target))
 
 
+def get_orm_association_proxies(
+    target: OrmFilterTarget,
+) -> dict[str, AssociationProxyInstance[object]]:
+    mapper = get_orm_mapper(target)
+    return {
+        key: descriptor.for_class(mapper.class_)
+        for key, descriptor in mapper.all_orm_descriptors.items()
+        if isinstance(descriptor, AssociationProxy)
+    }
+
+
 def describe_filter_target(target: FilterTarget) -> str:
     if is_orm_target(target):
         mapper = get_orm_mapper(target)
@@ -270,7 +297,11 @@ def describe_filter_target(target: FilterTarget) -> str:
 def list_filter_target_fields(target: FilterTarget) -> list[str]:
     if is_orm_target(target):
         mapper = get_orm_mapper(target)
-        return list(mapper.column_attrs.keys()) + list(mapper.relationships.keys())
+        return (
+            list(mapper.column_attrs.keys())
+            + list(mapper.relationships.keys())
+            + list(get_orm_association_proxies(target).keys())
+        )
     return [column.key for column in reversed(list(target.columns))]
 
 
@@ -435,10 +466,16 @@ def build_orm_path_filter(
     parsed_single_filter: ParsedFilter,
 ) -> ColumnExpressionArgument[bool]:
     mapper = get_orm_mapper(target)
+    association_proxies = get_orm_association_proxies(target)
 
     field_name = field_path[0]
     if len(field_path) == 1:
         if field_name not in mapper.column_attrs:
+            if field_name in association_proxies:
+                return build_column_filter(
+                    column=association_proxies[field_name],
+                    parsed_single_filter=parsed_single_filter,
+                )
             raise InvalidFilteringColumn(
                 filter_query=parsed_single_filter["original_filter"],
                 target_type=describe_filter_target(target),
@@ -460,6 +497,19 @@ def build_orm_path_filter(
                 ),
                 parsed_single_filter=parsed_single_filter,
             )
+
+    if field_name in association_proxies:
+        association_proxy = association_proxies[field_name]
+        remote_property = getattr(association_proxy.remote_attr, "property", None)
+        if isinstance(remote_property, RelationshipProperty):
+            association_filter = build_orm_path_filter(
+                target=cast(OrmFilterTarget, remote_property.mapper.class_),
+                field_path=field_path[1:],
+                parsed_single_filter=parsed_single_filter,
+            )
+            if association_proxy.scalar:
+                return association_proxy.has(association_filter)
+            return association_proxy.any(association_filter)
 
     if field_name not in mapper.relationships:
         raise InvalidFilteringColumn(
